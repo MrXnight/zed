@@ -133,6 +133,9 @@ const EDIT_PREDICTION_SETTLED_TTL: Duration = Duration::from_secs(60 * 5);
 const EDIT_PREDICTION_SETTLED_QUIESCENCE: Duration = Duration::from_secs(10);
 const EDIT_PREDICTION_CAPTURE_MIN_FUTURE_EVENTS: u32 = 1;
 const EDIT_PREDICTION_CAPTURE_MAX_FUTURE_EVENTS: usize = 4;
+/// The server rejects settled bodies larger than 64 KiB (compressed).
+const EDIT_PREDICTION_SETTLED_MAX_BODY_BYTES: usize = 63 * 1024;
+const EDIT_PREDICTION_SETTLED_MAX_EDITABLE_REGION_BYTES: usize = 4 * 1024;
 
 pub struct EditPredictionJumpsFeatureFlag;
 
@@ -2038,9 +2041,21 @@ impl EditPredictionStore {
                                 pending_prediction_captures.remove(pending_index);
                                 continue;
                             };
+                            let editable_offset_range = pending_capture
+                                .editable_anchor_range
+                                .to_offset(&registered_buffer.snapshot);
+                            if editable_offset_range.len()
+                                > EDIT_PREDICTION_SETTLED_MAX_EDITABLE_REGION_BYTES
+                            {
+                                // The prediction was obliterated by a huge edit;
+                                // kept-rate against it would be meaningless and the
+                                // region would blow the body size cap.
+                                pending_prediction_captures.remove(pending_index);
+                                continue;
+                            }
                             let settled_editable_region = registered_buffer
                                 .snapshot
-                                .text_for_range(pending_capture.editable_anchor_range.clone())
+                                .text_for_range(editable_offset_range)
                                 .collect::<String>();
                             let mut pending_capture =
                                 pending_prediction_captures.remove(pending_index);
@@ -2138,7 +2153,7 @@ impl EditPredictionStore {
                             let settled_editable_region =
                                 can_collect_data.then_some(settled_editable_region);
 
-                            let body = SubmitEditPredictionSettledBody {
+                            let mut body = SubmitEditPredictionSettledBody {
                                 request_id: request_id.0.to_string(),
                                 trigger,
                                 settled_editable_region,
@@ -2164,8 +2179,12 @@ impl EditPredictionStore {
                                 e2e_latency_ms: e2e_latency.as_millis(),
                             };
 
-                            let json_bytes = serde_json::to_vec(&body)?;
-                            let compressed = zstd::encode_all(&json_bytes[..], 3)?;
+                            let mut compressed =
+                                zstd::encode_all(&serde_json::to_vec(&body)?[..], 3)?;
+                            if compressed.len() > EDIT_PREDICTION_SETTLED_MAX_BODY_BYTES {
+                                body.sample_data = None;
+                                compressed = zstd::encode_all(&serde_json::to_vec(&body)?[..], 3)?;
+                            }
 
                             let url = client
                                 .http_client()
