@@ -2775,6 +2775,7 @@ fn test_active_buffer_diagnostics_collection_limits(cx: &mut TestAppContext) {
     let text = (0..300)
         .map(|row| format!("line {row} has some diagnostic context\n"))
         .collect::<String>();
+    let long_message = "diagnostic message ".repeat(1000);
     let buffer = cx.new(|cx| Buffer::local(&text, cx));
 
     buffer.update(cx, |buffer, cx| {
@@ -2784,7 +2785,7 @@ fn test_active_buffer_diagnostics_collection_limits(cx: &mut TestAppContext) {
                 range: text::PointUtf16::new(150, 0)..text::PointUtf16::new(150, 4),
                 diagnostic: Diagnostic {
                     severity: DiagnosticSeverity::ERROR,
-                    message: "long snippet".to_string(),
+                    message: long_message.clone(),
                     group_id: 1,
                     is_primary: true,
                     source_kind: language::DiagnosticSourceKind::Pushed,
@@ -2805,6 +2806,8 @@ fn test_active_buffer_diagnostics_collection_limits(cx: &mut TestAppContext) {
     );
 
     assert_eq!(active_buffer_diagnostics.len(), 1);
+    assert!(active_buffer_diagnostics[0].message.len() <= 128 * 3 + 2);
+    assert!(active_buffer_diagnostics[0].message.len() < long_message.len());
     assert!(active_buffer_diagnostics[0].snippet.len() <= 512 * 3 + 2);
     assert!(active_buffer_diagnostics[0].snippet.len() < text.len());
 }

@@ -172,6 +172,13 @@ pub struct SubmitEditPredictionSettledSampleData {
     pub next_edit_cursor_offset: Option<usize>,
 }
 
+pub const MAX_EDIT_PREDICTION_SETTLED_PER_REQUEST: usize = 32;
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct SubmitEditPredictionSettledBatchBody {
+    pub predictions: Vec<SubmitEditPredictionSettledBody>,
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct SubmitEditPredictionSettledResponse {}
 

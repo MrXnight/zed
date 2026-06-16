@@ -4,7 +4,8 @@ use client::{Client, EditPredictionUsage, UserStore, global_llm_token};
 use cloud_api_client::LlmApiToken;
 use cloud_api_types::{
     EditPredictionRecentFile, EditPredictionSettledKeptChars, EditPredictionTrigger,
-    OrganizationId, SubmitEditPredictionFeedbackBody, SubmitEditPredictionSettledBody,
+    MAX_EDIT_PREDICTION_SETTLED_PER_REQUEST, OrganizationId, SubmitEditPredictionFeedbackBody,
+    SubmitEditPredictionSettledBody, SubmitEditPredictionSettledResponse,
     SubmitEditPredictionSettledSampleData,
 };
 use cloud_llm_client::predict_edits_v3::{
@@ -48,7 +49,7 @@ use language::{
 use project::{DisableAiSettings, Project, ProjectPath, WorktreeId};
 use release_channel::AppVersion;
 use semver::Version;
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use settings::{
     EditPredictionDataCollectionChoice, EditPredictionProvider, Settings as _, update_settings_file,
 };
@@ -136,6 +137,11 @@ const EDIT_PREDICTION_CAPTURE_MAX_FUTURE_EVENTS: usize = 4;
 /// The server rejects settled bodies larger than 64 KiB (compressed).
 const EDIT_PREDICTION_SETTLED_MAX_BODY_BYTES: usize = 63 * 1024;
 const EDIT_PREDICTION_SETTLED_MAX_EDITABLE_REGION_BYTES: usize = 4 * 1024;
+
+#[derive(Serialize)]
+struct SubmitEditPredictionSettledBatchBodyRef<'a> {
+    predictions: &'a [SubmitEditPredictionSettledBody],
+}
 
 pub struct EditPredictionJumpsFeatureFlag;
 
@@ -2080,26 +2086,11 @@ impl EditPredictionStore {
                 }
             });
 
+            let mut ready_predictions_by_organization_id: HashMap<_, Vec<_>> = HashMap::default();
             for (pending_capture, settled_editable_region) in ready_predictions {
-                let PendingPredictionCapture {
-                    request_id,
-                    trigger,
-                    editable_region_before_prediction,
-                    predicted_editable_region,
-                    ts_error_count_before_prediction,
-                    ts_error_count_after_prediction,
-                    organization_id,
-                    can_collect_data,
-                    is_in_open_source_repo,
-                    sample_data,
-                    model_version,
-                    e2e_latency,
-                    ..
-                } = pending_capture;
-                let settled_editable_region_for_metrics = settled_editable_region.clone();
                 #[cfg(test)]
                 {
-                    let request_id = request_id.clone();
+                    let request_id = pending_capture.request_id.clone();
                     let settled_editable_region = settled_editable_region.clone();
                     this.update(cx, |this, _| {
                         if let Some(callback) = &this.settled_event_callback {
@@ -2107,107 +2098,43 @@ impl EditPredictionStore {
                         }
                     });
                 }
+
+                ready_predictions_by_organization_id
+                    .entry(pending_capture.organization_id.clone())
+                    .or_default()
+                    .push((pending_capture, settled_editable_region));
+            }
+
+            for (organization_id, ready_predictions) in ready_predictions_by_organization_id {
                 cx.background_spawn({
                     let client = client.clone();
                     let llm_token = llm_token.clone();
                     let app_version = app_version.clone();
                     async move {
-                        let kept_rate_result = compute_kept_rate(
-                            &editable_region_before_prediction,
-                            &predicted_editable_region,
-                            &settled_editable_region_for_metrics,
-                        );
-
-                        let result: anyhow::Result<()> = async {
-                            let sample_data = if can_collect_data
-                                && let Some(sample_data) = sample_data
-                                && sample_data.edit_events_before_quiescence
-                                    >= EDIT_PREDICTION_CAPTURE_MIN_FUTURE_EVENTS
-                                && let Ok(context) = sample_data.context_task.await
-                            {
-                                Some(SubmitEditPredictionSettledSampleData {
-                                    repository_url: context.repository_url,
-                                    revision: context.revision,
-                                    uncommitted_diff: context.uncommitted_diff,
-                                    editable_path: sample_data.editable_path,
-                                    editable_offset_range: sample_data.editable_offset_range,
-                                    buffer_diagnostics: context.buffer_diagnostics,
-                                    future_edit_history_events: sample_data
-                                        .future_edit_history_events,
-                                    navigation_history: sample_data
-                                        .navigation_history
-                                        .into_iter()
-                                        .map(|file| EditPredictionRecentFile {
-                                            path: file.path,
-                                            cursor_position: file.cursor_position,
-                                        })
-                                        .collect(),
-                                    edit_events_before_quiescence: sample_data
-                                        .edit_events_before_quiescence,
-                                    next_edit_cursor_offset: sample_data.next_edit_cursor_offset,
-                                })
-                            } else {
-                                None
-                            };
-
-                            let settled_editable_region =
-                                can_collect_data.then_some(settled_editable_region);
-
-                            let mut body = SubmitEditPredictionSettledBody {
-                                request_id: request_id.0.to_string(),
-                                trigger,
-                                settled_editable_region,
-                                ts_error_count_before_prediction,
-                                ts_error_count_after_prediction,
-                                can_collect_data,
-                                is_in_open_source_repo,
-                                sample_data,
-                                kept_chars: EditPredictionSettledKeptChars {
-                                    candidate_new: kept_rate_result.candidate_new_chars,
-                                    reference_new: kept_rate_result.reference_new_chars,
-                                    candidate_deleted: kept_rate_result.candidate_deleted_chars,
-                                    reference_deleted: kept_rate_result.reference_deleted_chars,
-                                    kept: kept_rate_result.kept_chars,
-                                    correctly_deleted: kept_rate_result.correctly_deleted_chars,
-                                    discarded: kept_rate_result.discarded_chars,
-                                    context: kept_rate_result.context_chars,
-                                    kept_rate: kept_rate_result.kept_rate,
-                                    recall_rate: kept_rate_result.recall_rate,
-                                },
-                                example: None,
-                                model_version,
-                                e2e_latency_ms: e2e_latency.as_millis(),
-                            };
-
-                            let mut compressed =
-                                zstd::encode_all(&serde_json::to_vec(&body)?[..], 3)?;
-                            if compressed.len() > EDIT_PREDICTION_SETTLED_MAX_BODY_BYTES {
-                                body.sample_data = None;
-                                compressed = zstd::encode_all(&serde_json::to_vec(&body)?[..], 3)?;
+                        if let Err(error) = async {
+                            let mut bodies = Vec::with_capacity(ready_predictions.len());
+                            for (pending_capture, settled_editable_region) in ready_predictions {
+                                bodies.push(
+                                    Self::settled_prediction_body(
+                                        pending_capture,
+                                        settled_editable_region,
+                                    )
+                                    .await,
+                                );
                             }
 
-                            let url = client
-                                .http_client()
-                                .build_zed_llm_url("/predict_edits/settled", &[])?;
-                            Self::send_api_request::<serde_json::Value>(
-                                |builder| {
-                                    Ok(builder
-                                        .uri(url.as_ref())
-                                        .header("Content-Encoding", "zstd")
-                                        .body(compressed.clone().into())?)
-                                },
+                            Self::send_settled_prediction_batches(
                                 client,
                                 llm_token,
                                 organization_id,
                                 app_version,
+                                bodies,
                             )
-                            .await?;
-                            Ok(())
+                            .await
                         }
-                        .await;
-
-                        if let Err(error) = result {
-                            log::error!("failed to submit edit prediction settled: {error:?}");
+                        .await
+                        {
+                            log::error!("failed to submit edit predictions settled: {error:?}");
                         }
                     }
                 })
@@ -2216,6 +2143,145 @@ impl EditPredictionStore {
 
             next_wake_time = oldest_edited_at.map(|time| time + EDIT_PREDICTION_SETTLED_QUIESCENCE);
         }
+    }
+
+    async fn settled_prediction_body(
+        pending_capture: PendingPredictionCapture,
+        settled_editable_region: String,
+    ) -> SubmitEditPredictionSettledBody {
+        let PendingPredictionCapture {
+            request_id,
+            trigger,
+            editable_region_before_prediction,
+            predicted_editable_region,
+            ts_error_count_before_prediction,
+            ts_error_count_after_prediction,
+            can_collect_data,
+            is_in_open_source_repo,
+            sample_data,
+            model_version,
+            e2e_latency,
+            ..
+        } = pending_capture;
+        let kept_rate_result = compute_kept_rate(
+            &editable_region_before_prediction,
+            &predicted_editable_region,
+            &settled_editable_region,
+        );
+
+        let sample_data = if can_collect_data
+            && let Some(sample_data) = sample_data
+            && sample_data.edit_events_before_quiescence
+                >= EDIT_PREDICTION_CAPTURE_MIN_FUTURE_EVENTS
+            && let Ok(context) = sample_data.context_task.await
+        {
+            Some(SubmitEditPredictionSettledSampleData {
+                repository_url: context.repository_url,
+                revision: context.revision,
+                uncommitted_diff: context.uncommitted_diff,
+                editable_path: sample_data.editable_path,
+                editable_offset_range: sample_data.editable_offset_range,
+                buffer_diagnostics: context.buffer_diagnostics,
+                future_edit_history_events: sample_data.future_edit_history_events,
+                navigation_history: sample_data
+                    .navigation_history
+                    .into_iter()
+                    .map(|file| EditPredictionRecentFile {
+                        path: file.path,
+                        cursor_position: file.cursor_position,
+                    })
+                    .collect(),
+                edit_events_before_quiescence: sample_data.edit_events_before_quiescence,
+                next_edit_cursor_offset: sample_data.next_edit_cursor_offset,
+            })
+        } else {
+            None
+        };
+
+        SubmitEditPredictionSettledBody {
+            request_id: request_id.0.to_string(),
+            trigger,
+            settled_editable_region: can_collect_data.then_some(settled_editable_region),
+            ts_error_count_before_prediction,
+            ts_error_count_after_prediction,
+            can_collect_data,
+            is_in_open_source_repo,
+            sample_data,
+            kept_chars: EditPredictionSettledKeptChars {
+                candidate_new: kept_rate_result.candidate_new_chars,
+                reference_new: kept_rate_result.reference_new_chars,
+                candidate_deleted: kept_rate_result.candidate_deleted_chars,
+                reference_deleted: kept_rate_result.reference_deleted_chars,
+                kept: kept_rate_result.kept_chars,
+                correctly_deleted: kept_rate_result.correctly_deleted_chars,
+                discarded: kept_rate_result.discarded_chars,
+                context: kept_rate_result.context_chars,
+                kept_rate: kept_rate_result.kept_rate,
+                recall_rate: kept_rate_result.recall_rate,
+            },
+            example: None,
+            model_version,
+            e2e_latency_ms: e2e_latency.as_millis(),
+        }
+    }
+
+    async fn send_settled_prediction_batches(
+        client: Arc<Client>,
+        llm_token: LlmApiToken,
+        organization_id: Option<OrganizationId>,
+        app_version: Version,
+        mut bodies: Vec<SubmitEditPredictionSettledBody>,
+    ) -> Result<()> {
+        let url = client
+            .http_client()
+            .build_zed_llm_url("/predict_edits/settled", &[])?;
+        let mut start = 0;
+
+        while start < bodies.len() {
+            let mut end = (start + MAX_EDIT_PREDICTION_SETTLED_PER_REQUEST).min(bodies.len());
+            let compressed = loop {
+                let compressed = Self::compress_settled_prediction_batch(&bodies[start..end])?;
+                if compressed.len() <= EDIT_PREDICTION_SETTLED_MAX_BODY_BYTES {
+                    break compressed;
+                }
+
+                if end == start + 1 {
+                    if bodies[start].sample_data.take().is_some() {
+                        continue;
+                    }
+                    anyhow::bail!(
+                        "settled prediction body exceeds {} bytes after dropping sample data",
+                        EDIT_PREDICTION_SETTLED_MAX_BODY_BYTES
+                    );
+                }
+
+                end -= 1;
+            };
+
+            Self::send_api_request::<SubmitEditPredictionSettledResponse>(
+                |builder| {
+                    Ok(builder
+                        .uri(url.as_ref())
+                        .header("Content-Encoding", "zstd")
+                        .body(compressed.clone().into())?)
+                },
+                client.clone(),
+                llm_token.clone(),
+                organization_id.clone(),
+                app_version.clone(),
+            )
+            .await?;
+            start = end;
+        }
+
+        Ok(())
+    }
+
+    fn compress_settled_prediction_batch(
+        batch: &[SubmitEditPredictionSettledBody],
+    ) -> Result<Vec<u8>> {
+        let body = SubmitEditPredictionSettledBatchBodyRef { predictions: batch };
+        Ok(zstd::encode_all(&serde_json::to_vec(&body)?[..], 3)?)
     }
 
     pub(crate) fn enqueue_settled_prediction(
